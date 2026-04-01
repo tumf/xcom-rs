@@ -219,10 +219,15 @@ pub fn build_conversation_edges(tweets: &[Tweet]) -> Vec<ConversationEdge> {
 /// Fetch a conversation tree from the API client.
 /// First fetches the root tweet to get its conversation_id, then searches for
 /// all tweets in the conversation and builds the tree.
+/// Missing tweets referenced in edges are backfilled via individual get_tweet calls
+/// to ensure thread continuity (search/recent may not return all tweets, e.g.
+/// the author's own thread replies).
 pub fn fetch_conversation(
     client: &dyn TweetApiClient,
     tweet_id: &str,
 ) -> Result<ConversationResult> {
+    use std::collections::HashSet;
+
     // Step 1: Get root tweet to obtain conversation_id
     let root_tweet = client.get_tweet(tweet_id)?;
     let conversation_id = root_tweet
@@ -239,6 +244,30 @@ pub fn fetch_conversation(
         posts.insert(0, root_tweet);
     }
 
+    // Step 3: Backfill missing tweets referenced in edges.
+    // search/recent may omit tweets (e.g. thread replies by the original author),
+    // so we collect all referenced parent tweet IDs and fetch any that are missing.
+    let mut known_ids: HashSet<String> = posts.iter().map(|t| t.id.clone()).collect();
+    let mut missing_ids: Vec<String> = Vec::new();
+
+    for post in &posts {
+        if let Some(refs) = &post.referenced_tweets {
+            for r in refs {
+                if r.ref_type == "replied_to" && !known_ids.contains(&r.id) {
+                    missing_ids.push(r.id.clone());
+                    known_ids.insert(r.id.clone());
+                }
+            }
+        }
+    }
+
+    // Fetch missing tweets individually (best-effort: skip failures)
+    for missing_id in &missing_ids {
+        if let Ok(tweet) = client.get_tweet(missing_id) {
+            posts.push(tweet);
+        }
+    }
+
     // Sort by created_at for stable ordering
     posts.sort_by(|a, b| {
         let a_time = a.created_at.as_deref().unwrap_or("");
@@ -246,7 +275,7 @@ pub fn fetch_conversation(
         a_time.cmp(b_time)
     });
 
-    // Step 3: Build edges
+    // Step 4: Build edges
     let edges = build_conversation_edges(&posts);
 
     Ok(ConversationResult {
