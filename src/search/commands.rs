@@ -4,6 +4,7 @@ use super::models::{
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::env;
 
 /// Arguments for recent tweet search
 #[derive(Debug, Clone)]
@@ -118,19 +119,122 @@ struct ApiMeta {
     next_token: Option<String>,
 }
 
+/// Xquik tweet search response wrapper.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum XquikSearchTweetsResponse {
+    Wrapped {
+        tweets: Vec<XquikTweet>,
+        #[serde(
+            default,
+            rename = "nextCursor",
+            alias = "nextToken",
+            alias = "next_cursor"
+        )]
+        next_cursor: Option<String>,
+    },
+    Data {
+        data: Vec<XquikTweet>,
+        #[serde(
+            default,
+            rename = "nextCursor",
+            alias = "nextToken",
+            alias = "next_cursor"
+        )]
+        next_cursor: Option<String>,
+    },
+    Items(Vec<XquikTweet>),
+}
+
+/// Xquik user search response wrapper.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum XquikSearchUsersResponse {
+    Wrapped {
+        users: Vec<XquikUser>,
+        #[serde(
+            default,
+            rename = "nextCursor",
+            alias = "nextToken",
+            alias = "next_cursor"
+        )]
+        next_cursor: Option<String>,
+    },
+    Data {
+        data: Vec<XquikUser>,
+        #[serde(
+            default,
+            rename = "nextCursor",
+            alias = "nextToken",
+            alias = "next_cursor"
+        )]
+        next_cursor: Option<String>,
+    },
+    Items(Vec<XquikUser>),
+}
+
+/// Xquik tweet data.
+#[derive(Debug, Deserialize)]
+struct XquikTweet {
+    id: String,
+    text: Option<String>,
+    #[serde(default, rename = "createdAt")]
+    created_at: Option<String>,
+    author: Option<XquikAuthor>,
+}
+
+/// Xquik tweet author data.
+#[derive(Debug, Deserialize)]
+struct XquikAuthor {
+    id: String,
+}
+
+/// Xquik user data.
+#[derive(Debug, Deserialize)]
+struct XquikUser {
+    id: String,
+    name: Option<String>,
+    username: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum SearchBackend {
+    XApi { bearer_token: String },
+    Xquik { api_key: String, base_url: String },
+}
+
 /// HTTP-based implementation of SearchClient using X API
 pub struct HttpSearchClient {
-    bearer_token: String,
+    backend: SearchBackend,
 }
 
 impl HttpSearchClient {
     /// Create a new HTTP search client with the given bearer token
     pub fn new(bearer_token: String) -> Self {
-        Self { bearer_token }
+        Self {
+            backend: SearchBackend::XApi { bearer_token },
+        }
+    }
+
+    /// Create a new HTTP search client that uses Xquik read endpoints
+    pub fn new_xquik(api_key: String, base_url: String) -> Self {
+        Self {
+            backend: SearchBackend::Xquik { api_key, base_url },
+        }
     }
 
     /// Create from environment variable (XCOM_RS_BEARER_TOKEN)
     pub fn from_env() -> Result<Self> {
+        if let Ok(api_key) = env::var("XQUIK_API_KEY") {
+            let trimmed = api_key.trim();
+            if !trimmed.is_empty() {
+                let base_url = env::var("XQUIK_API_BASE_URL")
+                    .unwrap_or_else(|_| "https://xquik.com/api/v1".to_string());
+                return Ok(Self::new_xquik(trimmed.to_string(), base_url));
+            }
+        }
+
         let auth_store = crate::auth::storage::AuthStore::new();
         let status = auth_store.status();
         if !status.authenticated {
@@ -139,36 +243,31 @@ impl HttpSearchClient {
             );
         }
         let bearer_token =
-            std::env::var("XCOM_RS_BEARER_TOKEN").context("XCOM_RS_BEARER_TOKEN not set")?;
+            env::var("XCOM_RS_BEARER_TOKEN").context("XCOM_RS_BEARER_TOKEN not set")?;
         Ok(Self::new(bearer_token))
     }
-}
 
-impl SearchClient for HttpSearchClient {
-    fn search_recent(&self, args: &SearchRecentArgs) -> Result<SearchRecentResult> {
+    fn search_recent_with_x_api(
+        bearer_token: &str,
+        args: &SearchRecentArgs,
+    ) -> Result<SearchRecentResult> {
         let mut url = "https://api.twitter.com/2/tweets/search/recent".to_string();
         let mut params = vec![
             ("query", args.query.clone()),
             ("max_results", args.limit.unwrap_or(10).to_string()),
         ];
 
-        // Add tweet.fields for full data
         params.push(("tweet.fields", "id,text,author_id,created_at".to_string()));
 
         if let Some(cursor) = &args.cursor {
             params.push(("next_token", cursor.clone()));
         }
 
-        // Build query string
-        let query_string: Vec<String> = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-            .collect();
         url.push('?');
-        url.push_str(&query_string.join("&"));
+        url.push_str(&encode_query_params(&params));
 
         let response = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {}", self.bearer_token))
+            .set("Authorization", &format!("Bearer {}", bearer_token))
             .call();
 
         let api_response: ApiSearchRecentResponse = match response {
@@ -194,20 +293,88 @@ impl SearchClient for HttpSearchClient {
 
         let result_count = tweets.len();
         let next_token = api_response.meta.and_then(|m| m.next_token);
-
-        let meta = Some(SearchResultMeta {
-            pagination: SearchPaginationMeta {
-                next_token,
-                prev_token: None,
-                result_count,
-            },
-        });
-
-        Ok(SearchRecentResult { tweets, meta })
+        Ok(SearchRecentResult {
+            tweets,
+            meta: Some(SearchResultMeta {
+                pagination: SearchPaginationMeta {
+                    next_token,
+                    prev_token: None,
+                    result_count,
+                },
+            }),
+        })
     }
 
-    fn search_users(&self, args: &SearchUsersArgs) -> Result<SearchUsersResult> {
-        // X API v1.1 endpoint for user search
+    fn search_recent_with_xquik(
+        api_key: &str,
+        base_url: &str,
+        args: &SearchRecentArgs,
+    ) -> Result<SearchRecentResult> {
+        let mut url = format!("{}/x/tweets/search", base_url.trim_end_matches('/'));
+        let mut params = vec![("q", args.query.clone())];
+        if let Some(limit) = args.limit {
+            params.push(("limit", limit.to_string()));
+        }
+        if let Some(cursor) = &args.cursor {
+            params.push(("cursor", cursor.clone()));
+        }
+        url.push('?');
+        url.push_str(&encode_query_params(&params));
+
+        let response = ureq::get(&url)
+            .set("x-api-key", api_key)
+            .set("Accept", "application/json")
+            .call();
+
+        let api_response: XquikSearchTweetsResponse = match response {
+            Ok(resp) => resp.into_json().context("Failed to parse Xquik response")?,
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                anyhow::bail!("Xquik API error {}: {}", code, body);
+            }
+            Err(e) => anyhow::bail!("Failed to call Xquik tweet search: {}", e),
+        };
+
+        let (tweets, next_token) = match api_response {
+            XquikSearchTweetsResponse::Wrapped {
+                tweets,
+                next_cursor,
+            } => (tweets, next_cursor),
+            XquikSearchTweetsResponse::Data { data, next_cursor } => (data, next_cursor),
+            XquikSearchTweetsResponse::Items(tweets) => (tweets, None),
+        };
+
+        let mut tweets = tweets
+            .into_iter()
+            .map(|tweet| SearchTweet {
+                id: tweet.id,
+                text: tweet.text,
+                author_id: tweet.author.map(|author| author.id),
+                created_at: tweet.created_at,
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(limit) = args.limit {
+            tweets.truncate(limit);
+        }
+
+        let result_count = tweets.len();
+        Ok(SearchRecentResult {
+            tweets,
+            meta: Some(SearchResultMeta {
+                pagination: SearchPaginationMeta {
+                    next_token,
+                    prev_token: None,
+                    result_count,
+                },
+            }),
+        })
+    }
+
+    fn search_users_with_x_api(
+        bearer_token: &str,
+        args: &SearchUsersArgs,
+    ) -> Result<SearchUsersResult> {
         let mut url = "https://api.twitter.com/1.1/users/search.json".to_string();
         let mut params = vec![
             ("q", args.query.clone()),
@@ -218,16 +385,11 @@ impl SearchClient for HttpSearchClient {
             params.push(("page", cursor.clone()));
         }
 
-        // Build query string
-        let query_string: Vec<String> = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-            .collect();
         url.push('?');
-        url.push_str(&query_string.join("&"));
+        url.push_str(&encode_query_params(&params));
 
         let response = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {}", self.bearer_token))
+            .set("Authorization", &format!("Bearer {}", bearer_token))
             .call();
 
         let api_users: Vec<ApiUser> = match response {
@@ -250,17 +412,112 @@ impl SearchClient for HttpSearchClient {
             .collect::<Vec<_>>();
 
         let result_count = users.len();
-
-        let meta = Some(SearchResultMeta {
-            pagination: SearchPaginationMeta {
-                next_token: None,
-                prev_token: None,
-                result_count,
-            },
-        });
-
-        Ok(SearchUsersResult { users, meta })
+        Ok(SearchUsersResult {
+            users,
+            meta: Some(SearchResultMeta {
+                pagination: SearchPaginationMeta {
+                    next_token: None,
+                    prev_token: None,
+                    result_count,
+                },
+            }),
+        })
     }
+
+    fn search_users_with_xquik(
+        api_key: &str,
+        base_url: &str,
+        args: &SearchUsersArgs,
+    ) -> Result<SearchUsersResult> {
+        let mut url = format!("{}/x/users/search", base_url.trim_end_matches('/'));
+        let mut params = vec![("q", args.query.clone())];
+        if let Some(limit) = args.limit {
+            params.push(("limit", limit.to_string()));
+        }
+        if let Some(cursor) = &args.cursor {
+            params.push(("cursor", cursor.clone()));
+        }
+        url.push('?');
+        url.push_str(&encode_query_params(&params));
+
+        let response = ureq::get(&url)
+            .set("x-api-key", api_key)
+            .set("Accept", "application/json")
+            .call();
+
+        let api_response: XquikSearchUsersResponse = match response {
+            Ok(resp) => resp.into_json().context("Failed to parse Xquik response")?,
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                anyhow::bail!("Xquik API error {}: {}", code, body);
+            }
+            Err(e) => anyhow::bail!("Failed to call Xquik user search: {}", e),
+        };
+
+        let (users, next_token) = match api_response {
+            XquikSearchUsersResponse::Wrapped { users, next_cursor } => (users, next_cursor),
+            XquikSearchUsersResponse::Data { data, next_cursor } => (data, next_cursor),
+            XquikSearchUsersResponse::Items(users) => (users, None),
+        };
+
+        let mut users = users
+            .into_iter()
+            .map(|user| SearchUser {
+                id: user.id,
+                name: user.name,
+                username: user.username,
+                description: user.description,
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(limit) = args.limit {
+            users.truncate(limit);
+        }
+
+        let result_count = users.len();
+        Ok(SearchUsersResult {
+            users,
+            meta: Some(SearchResultMeta {
+                pagination: SearchPaginationMeta {
+                    next_token,
+                    prev_token: None,
+                    result_count,
+                },
+            }),
+        })
+    }
+}
+
+impl SearchClient for HttpSearchClient {
+    fn search_recent(&self, args: &SearchRecentArgs) -> Result<SearchRecentResult> {
+        match &self.backend {
+            SearchBackend::XApi { bearer_token } => {
+                Self::search_recent_with_x_api(bearer_token, args)
+            }
+            SearchBackend::Xquik { api_key, base_url } => {
+                Self::search_recent_with_xquik(api_key, base_url, args)
+            }
+        }
+    }
+
+    fn search_users(&self, args: &SearchUsersArgs) -> Result<SearchUsersResult> {
+        match &self.backend {
+            SearchBackend::XApi { bearer_token } => {
+                Self::search_users_with_x_api(bearer_token, args)
+            }
+            SearchBackend::Xquik { api_key, base_url } => {
+                Self::search_users_with_xquik(api_key, base_url, args)
+            }
+        }
+    }
+}
+
+fn encode_query_params(params: &[(&str, String)]) -> String {
+    params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 impl SearchClient for MockSearchClient {
@@ -376,6 +633,7 @@ fn parse_cursor(cursor: &Option<String>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mockito::Server;
 
     #[test]
     fn test_search_recent_basic() {
@@ -508,6 +766,102 @@ mod tests {
 
         let result = cmd.search_users(args).unwrap();
         assert_eq!(result.users.len(), 10); // default limit
+    }
+
+    #[test]
+    fn test_xquik_search_recent_maps_response_fields() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/x/tweets/search")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("q".to_string(), "rust lang".to_string()),
+                mockito::Matcher::UrlEncoded("limit".to_string(), "2".to_string()),
+                mockito::Matcher::UrlEncoded("cursor".to_string(), "abc".to_string()),
+            ]))
+            .match_header("x-api-key", "test_xquik_key")
+            .match_header("accept", "application/json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tweets":[{"id":"1","text":"Rust","createdAt":"2026-01-01T00:00:00Z","author":{"id":"42"}},{"id":"2","text":"Xquik","createdAt":"2026-01-02T00:00:00Z","author":{"id":"43"}}],"next_cursor":"next"}"#,
+            )
+            .create();
+
+        let client = HttpSearchClient::new_xquik("test_xquik_key".to_string(), server.url());
+        let cmd = SearchCommand::with_client(client);
+        let args = SearchRecentArgs {
+            query: "rust lang".to_string(),
+            limit: Some(2),
+            cursor: Some("abc".to_string()),
+        };
+
+        let result = cmd.search_recent(args).unwrap();
+
+        mock.assert();
+        assert_eq!(result.tweets.len(), 2);
+        assert_eq!(result.tweets[0].id, "1");
+        assert_eq!(result.tweets[0].author_id, Some("42".to_string()));
+        assert_eq!(
+            result.tweets[0].created_at,
+            Some("2026-01-01T00:00:00Z".to_string())
+        );
+        let meta = result.meta.unwrap();
+        assert_eq!(meta.pagination.result_count, 2);
+        assert_eq!(meta.pagination.next_token, Some("next".to_string()));
+    }
+
+    #[test]
+    fn test_xquik_search_users_maps_response_fields() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/x/users/search")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("q".to_string(), "founder".to_string()),
+                mockito::Matcher::UrlEncoded("limit".to_string(), "1".to_string()),
+            ]))
+            .match_header("x-api-key", "test_xquik_key")
+            .match_header("accept", "application/json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"users":[{"id":"42","name":"Ada","username":"ada","description":"Builder"}],"nextToken":"users-next"}"#,
+            )
+            .create();
+
+        let client = HttpSearchClient::new_xquik("test_xquik_key".to_string(), server.url());
+        let cmd = SearchCommand::with_client(client);
+        let args = SearchUsersArgs {
+            query: "founder".to_string(),
+            limit: Some(1),
+            cursor: None,
+        };
+
+        let result = cmd.search_users(args).unwrap();
+
+        mock.assert();
+        assert_eq!(result.users.len(), 1);
+        assert_eq!(result.users[0].id, "42");
+        assert_eq!(result.users[0].username, Some("ada".to_string()));
+        assert_eq!(result.users[0].description, Some("Builder".to_string()));
+        let meta = result.meta.unwrap();
+        assert_eq!(meta.pagination.result_count, 1);
+        assert_eq!(meta.pagination.next_token, Some("users-next".to_string()));
+    }
+
+    #[test]
+    fn test_xquik_search_users_accepts_snake_case_cursor() {
+        let response: XquikSearchUsersResponse = serde_json::from_str(
+            r#"{"users":[{"id":"42","name":"Ada","username":"ada","description":"Builder"}],"next_cursor":"users-next"}"#,
+        )
+        .unwrap();
+
+        let next_cursor = match response {
+            XquikSearchUsersResponse::Wrapped { next_cursor, .. } => next_cursor,
+            XquikSearchUsersResponse::Data { next_cursor, .. } => next_cursor,
+            XquikSearchUsersResponse::Items(_) => None,
+        };
+
+        assert_eq!(next_cursor, Some("users-next".to_string()));
     }
 
     #[test]
