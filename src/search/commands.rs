@@ -125,12 +125,22 @@ struct ApiMeta {
 enum XquikSearchTweetsResponse {
     Wrapped {
         tweets: Vec<XquikTweet>,
-        #[serde(default, rename = "nextCursor", alias = "nextToken")]
+        #[serde(
+            default,
+            rename = "nextCursor",
+            alias = "nextToken",
+            alias = "next_cursor"
+        )]
         next_cursor: Option<String>,
     },
     Data {
         data: Vec<XquikTweet>,
-        #[serde(default, rename = "nextCursor", alias = "nextToken")]
+        #[serde(
+            default,
+            rename = "nextCursor",
+            alias = "nextToken",
+            alias = "next_cursor"
+        )]
         next_cursor: Option<String>,
     },
     Items(Vec<XquikTweet>),
@@ -142,12 +152,22 @@ enum XquikSearchTweetsResponse {
 enum XquikSearchUsersResponse {
     Wrapped {
         users: Vec<XquikUser>,
-        #[serde(default, rename = "nextCursor", alias = "nextToken")]
+        #[serde(
+            default,
+            rename = "nextCursor",
+            alias = "nextToken",
+            alias = "next_cursor"
+        )]
         next_cursor: Option<String>,
     },
     Data {
         data: Vec<XquikUser>,
-        #[serde(default, rename = "nextCursor", alias = "nextToken")]
+        #[serde(
+            default,
+            rename = "nextCursor",
+            alias = "nextToken",
+            alias = "next_cursor"
+        )]
         next_cursor: Option<String>,
     },
     Items(Vec<XquikUser>),
@@ -763,7 +783,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"{"tweets":[{"id":"1","text":"Rust","createdAt":"2026-01-01T00:00:00Z","author":{"id":"42"}},{"id":"2","text":"Xquik","createdAt":"2026-01-02T00:00:00Z","author":{"id":"43"}}],"nextCursor":"next"}"#,
+                r#"{"tweets":[{"id":"1","text":"Rust","createdAt":"2026-01-01T00:00:00Z","author":{"id":"42"}},{"id":"2","text":"Xquik","createdAt":"2026-01-02T00:00:00Z","author":{"id":"43"}}],"next_cursor":"next"}"#,
             )
             .create();
 
@@ -826,6 +846,22 @@ mod tests {
         let meta = result.meta.unwrap();
         assert_eq!(meta.pagination.result_count, 1);
         assert_eq!(meta.pagination.next_token, Some("users-next".to_string()));
+    }
+
+    #[test]
+    fn test_xquik_search_users_accepts_snake_case_cursor() {
+        let response: XquikSearchUsersResponse = serde_json::from_str(
+            r#"{"users":[{"id":"42","name":"Ada","username":"ada","description":"Builder"}],"next_cursor":"users-next"}"#,
+        )
+        .unwrap();
+
+        let next_cursor = match response {
+            XquikSearchUsersResponse::Wrapped { next_cursor, .. } => next_cursor,
+            XquikSearchUsersResponse::Data { next_cursor, .. } => next_cursor,
+            XquikSearchUsersResponse::Items(_) => None,
+        };
+
+        assert_eq!(next_cursor, Some("users-next".to_string()));
     }
 
     #[test]
